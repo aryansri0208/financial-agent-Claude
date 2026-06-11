@@ -1,0 +1,11 @@
+robin_stocks
+yfinance
+finnhub-python
+fredapi
+pycoingecko
+edgartools
+alpha_vantage
+pandas
+streamlit
+plotly
+python-dotenv

@@ -1,0 +1,26 @@
+# Environment & secrets
+.env
+.env.*
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Runtime output
+data/
+analysis_output.json
+pipeline.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
