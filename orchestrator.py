@@ -1,41 +1,157 @@
 """
 Multi-stage portfolio advisor pipeline.
 
-Stage 1: 6 data collection agents run in parallel
-Stage 2: 3 analysis agents run in parallel (fed Stage 1 JSON)
-Stage 3: 1 synthesis agent produces final analysis_output.json
+Stage 1 : 6 data-collection agents  (portfolio runs first, then 5 sequentially)
+Stage 2 : 3 analysis agents          (sequential with cooldown)
+Stage 3 : 1 synthesis agent
+
+Enhanced with:
+  - Rich progress bar (10 steps)
+  - Per-agent start / finish notifications
+  - API-pull confirmation (from each agent's output JSON)
+  - Full log written to pipeline.log
 """
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
+from datetime import datetime
 
 from dotenv import load_dotenv
 
-# Ensure project root is on path
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
-
-# Load API keys before agent imports (Anthropic, Robinhood, Finnhub, etc.)
 load_dotenv(os.path.join(ROOT, ".env"))
 
+# ── Rich setup ────────────────────────────────────────────────────────────────
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
+from rich.rule import Rule
+from rich import box
 
-async def _with_retry(label: str, coro_fn, *args, max_retries: int = 5, base_delay: float = 65.0):
-    """Run an agent coroutine with exponential backoff on rate-limit errors.
+LOG_FILE = os.path.join(ROOT, "pipeline.log")
+console = Console(highlight=False)
 
-    The SDK wraps all API-level 429s as `Exception("Claude Code returned an
-    error result: success")`, so we treat any SDK error result as a potential
-    rate-limit hit and retry — the model prints the 429 details to stdout
-    before the SDK raises.
-    """
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[logging.FileHandler(LOG_FILE, mode="w", encoding="utf-8")],
+    force=True,
+)
+log = logging.getLogger("pipeline")
+
+
+# ── Pipeline step registry ────────────────────────────────────────────────────
+#  (stage_label, agent_name, data_sources_hint)
+STEPS = [
+    ("Stage 1", "portfolio",          "Robinhood"),
+    ("Stage 1", "fundamentals",       "Finnhub + Yahoo Finance"),
+    ("Stage 1", "macro",              "FRED + Yahoo Finance"),
+    ("Stage 1", "crypto",             "CoinGecko"),
+    ("Stage 1", "news",               "Alpha Vantage + Finnhub"),
+    ("Stage 1", "etf",                "Yahoo Finance"),
+    ("Stage 2", "portfolio_analysis", "Stage-1 data"),
+    ("Stage 2", "opportunities",      "Stage-1 data"),
+    ("Stage 2", "technicals",         "Yahoo Finance"),
+    ("Stage 3", "synthesis",          "Stage-1 + Stage-2 data"),
+]
+TOTAL = len(STEPS)
+
+# JSON output path for each agent (to extract API source confirmations)
+_AGENT_OUTPUT = {
+    "portfolio":          os.path.join(ROOT, "data", "stage1", "portfolio.json"),
+    "fundamentals":       os.path.join(ROOT, "data", "stage1", "fundamentals.json"),
+    "macro":              os.path.join(ROOT, "data", "stage1", "macro.json"),
+    "crypto":             os.path.join(ROOT, "data", "stage1", "crypto.json"),
+    "news":               os.path.join(ROOT, "data", "stage1", "news.json"),
+    "etf":                os.path.join(ROOT, "data", "stage1", "etf.json"),
+    "portfolio_analysis": os.path.join(ROOT, "data", "stage2", "portfolio_analysis.json"),
+    "opportunities":      os.path.join(ROOT, "data", "stage2", "opportunities.json"),
+    "technicals":         os.path.join(ROOT, "data", "stage2", "technicals.json"),
+    "synthesis":          os.path.join(ROOT, "analysis_output.json"),
+}
+
+
+# ── Notification helpers ──────────────────────────────────────────────────────
+
+def _ts() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def notify_start(agent: str, step: int, apis: str):
+    msg = f"▶  [{step}/{TOTAL}] {agent}  ({apis})"
+    console.print(f"[bold cyan]{msg}[/bold cyan]  [dim]{_ts()}[/dim]")
+    log.info(f"START  {msg}")
+
+
+def notify_finish(agent: str, step: int, status: str, cost: float, elapsed: float, sources: list[str]):
+    ok = status == "success"
+    icon = "✅" if ok else "❌"
+    color = "green" if ok else "red"
+    src_str = ", ".join(sources) if sources else "—"
+    console.print(
+        f"[bold {color}]{icon} [{step}/{TOTAL}] {agent}[/bold {color}]"
+        f"  status=[bold]{status}[/bold]"
+        f"  cost=[yellow]${cost:.4f}[/yellow]"
+        f"  [dim]{elapsed:.1f}s  {_ts()}[/dim]"
+    )
+    if sources:
+        console.print(f"   [dim]APIs confirmed: {src_str}[/dim]")
+    log.info(
+        f"FINISH [{step}/{TOTAL}] {agent}  status={status}"
+        f"  cost=${cost:.4f}  elapsed={elapsed:.1f}s"
+        f"  apis={src_str}"
+    )
+
+
+def _read_sources(agent: str) -> list[str]:
+    path = _AGENT_OUTPUT.get(agent, "")
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        # Collect "sources" from top-level or one level deep (fundamentals has per-ticker)
+        raw: list[dict] = data.get("sources", [])
+        if not raw:
+            for v in data.values():
+                if isinstance(v, dict):
+                    raw.extend(v.get("sources", []))
+                elif isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, dict):
+                            raw.extend(item.get("sources", []))
+        seen: set[str] = set()
+        names: list[str] = []
+        for s in raw:
+            n = s.get("source_name") or s.get("name") or ""
+            if n and n not in seen:
+                seen.add(n)
+                names.append(n)
+        return names
+    except Exception:
+        return []
+
+
+# ── Retry wrapper ─────────────────────────────────────────────────────────────
+
+async def _with_retry(label: str, coro_fn, *args, max_retries: int = 5, base_delay: float = 65.0, max_delay: float = 120.0):
     for attempt in range(max_retries):
         try:
             return await coro_fn(*args)
         except Exception as e:
             err_str = str(e).lower()
-            # The SDK raises "error result: success" for all API errors (including 429).
-            # Also catch explicit 429 / rate-limit keywords just in case.
             is_retryable = (
                 "error result" in err_str
                 or "429" in err_str
@@ -43,27 +159,33 @@ async def _with_retry(label: str, coro_fn, *args, max_retries: int = 5, base_del
                 or "rate_limit" in err_str
             )
             if is_retryable and attempt < max_retries - 1:
-                wait = base_delay * (2 ** attempt)
-                print(f"\n⚠️  [{label}] API error (likely rate limit) — waiting {wait:.0f}s before retry {attempt+1}/{max_retries-1}...")
+                wait = min(base_delay * (2 ** attempt), max_delay)
+                console.print(f"[yellow]⚠  [{label}] rate-limit — retrying in {wait:.0f}s (attempt {attempt+1})[/yellow]")
+                log.warning(f"RATE_LIMIT [{label}] waiting {wait:.0f}s before retry {attempt+1}/{max_retries-1}")
                 await asyncio.sleep(wait)
             else:
-                print(f"\n❌  [{label}] Failed after {attempt+1} attempt(s): {e}")
+                console.print(f"[red]❌  [{label}] failed after {attempt+1} attempt(s): {e}[/red]")
+                log.error(f"FAILED [{label}] after {attempt+1} attempts: {e}")
                 return {"status": "error", "cost": 0, "error": str(e)}
     return {"status": "error", "cost": 0}
 
-from agents.stage1_portfolio import run as run_portfolio
+
+# ── Agent imports ─────────────────────────────────────────────────────────────
+from agents.stage1_portfolio    import run as run_portfolio
 from agents.stage1_fundamentals import run as run_fundamentals
-from agents.stage1_macro import run as run_macro
-from agents.stage1_crypto import run as run_crypto
-from agents.stage1_news import run as run_news
-from agents.stage1_etf import run as run_etf
+from agents.stage1_macro        import run as run_macro
+from agents.stage1_crypto       import run as run_crypto
+from agents.stage1_news         import run as run_news
+from agents.stage1_etf          import run as run_etf
 
 from agents.stage2_portfolio_analysis import run as run_portfolio_analysis
-from agents.stage2_opportunities import run as run_opportunities
-from agents.stage2_technicals import run as run_technicals
+from agents.stage2_opportunities      import run as run_opportunities
+from agents.stage2_technicals         import run as run_technicals
 
 from agents.stage3_synthesis import run as run_synthesis
 
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
 
 def _load_json(path: str) -> dict:
     full = os.path.join(ROOT, path)
@@ -73,20 +195,12 @@ def _load_json(path: str) -> dict:
         return json.load(f)
 
 
-def _get_tickers_from_portfolio() -> list[str]:
+def _get_tickers() -> list[str]:
     data = _load_json("data/stage1/portfolio.json")
     return [h["ticker"] for h in data.get("holdings", [])]
 
 
-def _print_stage(label: str):
-    print(f"\n{'='*60}")
-    print(f"  {label}")
-    print(f"{'='*60}")
-
-
-
 def _clean_data_dirs():
-    """Remove all stage JSON files so Write tool can create them fresh."""
     import glob
     for pattern in [
         os.path.join(ROOT, "data", "stage1", "*.json"),
@@ -99,87 +213,138 @@ def _clean_data_dirs():
     os.makedirs(os.path.join(ROOT, "data", "stage2"), exist_ok=True)
 
 
-async def run_pipeline():
+# ── Main pipeline ─────────────────────────────────────────────────────────────
+
+async def run_pipeline(resume: bool = False):
     total_cost = 0.0
-    start = time.time()
+    pipeline_start = time.time()
 
-    print("\nCleaning old data files so agents can write fresh...")
-    _clean_data_dirs()
+    log.info("=" * 70)
+    log.info("PIPELINE %s  %s", "RESUME" if resume else "START", datetime.now().isoformat())
+    log.info("=" * 70)
 
-    # ── Stage 1 ───────────────────────────────────────────────────
-    _print_stage("STAGE 1: Data Collection (parallel)")
+    console.print(Panel.fit(
+        "[bold white]Portfolio Advisor — Multi-Agent Pipeline[/bold white]\n"
+        f"[dim]Mode    : {'RESUME from Stage 2' if resume else 'Full run'}[/dim]\n"
+        f"[dim]Started : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}[/dim]\n"
+        f"[dim]Log file: {LOG_FILE}[/dim]",
+        border_style="bright_blue",
+        padding=(0, 2),
+    ))
 
-    # Portfolio runs first alone so we can extract tickers for other agents
-    print("\n[Stage 1] Fetching Robinhood portfolio...")
-    portfolio_result = await _with_retry("portfolio", run_portfolio)
-    total_cost += portfolio_result.get("cost", 0) or 0
+    if not resume:
+        console.print(f"\nCleaning stale data files…")
+        log.info("Cleaning stale data files")
+        _clean_data_dirs()
 
-    tickers = _get_tickers_from_portfolio()
-    if not tickers:
-        raise RuntimeError(
-            "Portfolio fetch returned no holdings. Check Robinhood credentials in .env "
-            "and confirm the portfolio agent wrote data/stage1/portfolio.json correctly."
-        )
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=None),
+        TaskProgressColumn(),
+        TimeElapsedColumn(),
+        console=console,
+        transient=False,
+        expand=True,
+    ) as progress:
+        completed = 6 if resume else 0
+        overall = progress.add_task("Overall pipeline", total=TOTAL, completed=completed)
 
-    print(f"\n[Stage 1] Portfolio tickers: {tickers}")
-    print("[Stage 1] Running data agents sequentially to respect rate limits...")
+        async def run_step(step_idx: int, agent: str, fn, fn_args: tuple):
+            nonlocal total_cost
+            _, _, apis = STEPS[step_idx - 1]
+            notify_start(agent, step_idx, apis)
+            progress.update(overall, description=f"[bold blue]{agent}")
+            t0 = time.time()
+            r = await _with_retry(agent, fn, *fn_args)
+            elapsed = round(time.time() - t0, 1)
+            cost = r.get("cost", 0) or 0
+            total_cost += cost
+            sources = _read_sources(agent)
+            notify_finish(agent, step_idx, r.get("status", "error"), cost, elapsed, sources)
+            progress.advance(overall)
+            return r
 
-    # Sequential to stay within per-minute input/output token budgets
-    COOLDOWN = 30  # seconds between agents to let token buckets refill
-    for label, fn, fn_args in [
-        ("fundamentals", run_fundamentals, (tickers,)),
-        ("macro",        run_macro,        ()),
-        ("crypto",       run_crypto,       ()),
-        ("news",         run_news,         (tickers,)),
-        ("etf",          run_etf,          ()),
-    ]:
-        print(f"\n▶  [{label}] starting...")
-        r = await _with_retry(label, fn, *fn_args)
-        total_cost += r.get("cost", 0) or 0
-        print(f"  ✅  [{label}] done — cost so far: ${total_cost:.4f}")
-        print(f"  ⏳  Cooling down {COOLDOWN}s before next agent...")
-        await asyncio.sleep(COOLDOWN)
+        if not resume:
+            # ── Stage 1 ───────────────────────────────────────────────────────
+            console.print(Rule("[bold magenta]STAGE 1 — Data Collection[/bold magenta]"))
+            log.info("--- STAGE 1: Data Collection ---")
 
-    _print_stage("STAGE 1 COMPLETE")
+            await run_step(1, "portfolio", run_portfolio, ())
 
-    # ── Stage 2 ───────────────────────────────────────────────────
-    print(f"\n⏳  Waiting 65s for rate-limit buckets to reset before Stage 2...")
-    await asyncio.sleep(65)
-    _print_stage("STAGE 2: Analysis (sequential)")
+            tickers = _get_tickers()
+            if not tickers:
+                raise RuntimeError(
+                    "Portfolio fetch returned no holdings. "
+                    "Check Robinhood credentials in .env and verify portfolio.json was written."
+                )
+            console.print(f"[dim]Tickers in portfolio: {', '.join(tickers)}[/dim]")
+            log.info("Portfolio tickers: %s", tickers)
 
-    for label, fn in [
-        ("portfolio_analysis", run_portfolio_analysis),
-        ("opportunities",      run_opportunities),
-        ("technicals",         run_technicals),
-    ]:
-        print(f"\n▶  [{label}] starting...")
-        r = await _with_retry(label, fn)
-        total_cost += r.get("cost", 0) or 0
-        print(f"  ✅  [{label}] done — cost so far: ${total_cost:.4f}")
-        print(f"  ⏳  Cooling down {COOLDOWN}s before next agent...")
-        await asyncio.sleep(COOLDOWN)
+            for step_idx, agent, fn, fn_args in [
+                (2, "fundamentals", run_fundamentals, (tickers,)),
+                (3, "macro",        run_macro,        ()),
+                (4, "crypto",       run_crypto,       ()),
+                (5, "news",         run_news,         (tickers,)),
+                (6, "etf",          run_etf,          ()),
+            ]:
+                await run_step(step_idx, agent, fn, fn_args)
 
-    _print_stage("STAGE 2 COMPLETE")
+            console.print(Rule("[bold green]STAGE 1 COMPLETE[/bold green]"))
+            log.info("--- STAGE 1 COMPLETE ---")
+        else:
+            tickers = _get_tickers()
+            console.print(Rule("[bold yellow]RESUMING FROM STAGE 2[/bold yellow]"))
+            console.print(f"[dim]Tickers: {', '.join(tickers)}[/dim]")
+            log.info("Resuming from Stage 2. Tickers: %s", tickers)
 
-    # ── Stage 3 ───────────────────────────────────────────────────
-    print(f"\n⏳  Waiting 65s for rate-limit buckets to reset before Stage 3...")
-    await asyncio.sleep(65)
-    _print_stage("STAGE 3: Synthesis")
+        # ── Stage 2 ───────────────────────────────────────────────────────────
+        console.print(Rule("[bold magenta]STAGE 2 — Analysis[/bold magenta]"))
+        log.info("--- STAGE 2: Analysis ---")
 
-    synthesis_result = await _with_retry("synthesis", run_synthesis)
-    total_cost += synthesis_result.get("cost", 0) or 0
+        for step_idx, agent, fn in [
+            (7, "portfolio_analysis", run_portfolio_analysis),
+            (8, "opportunities",      run_opportunities),
+            (9, "technicals",         run_technicals),
+        ]:
+            await run_step(step_idx, agent, fn, ())
 
-    elapsed = round(time.time() - start, 1)
-    _print_stage(f"PIPELINE COMPLETE — {elapsed}s — ${total_cost:.4f} total cost")
+        console.print(Rule("[bold green]STAGE 2 COMPLETE[/bold green]"))
+        log.info("--- STAGE 2 COMPLETE ---")
 
+        # ── Stage 3 ───────────────────────────────────────────────────────────
+        console.print(Rule("[bold magenta]STAGE 3 — Synthesis[/bold magenta]"))
+        log.info("--- STAGE 3: Synthesis ---")
+        await run_step(10, "synthesis", run_synthesis, ())
+
+        progress.update(overall, description="[bold green]Pipeline complete")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    elapsed_total = round(time.time() - pipeline_start, 1)
     output_path = os.path.join(ROOT, "analysis_output.json")
-    if os.path.exists(output_path):
-        print(f"\nFinal report written to: {output_path}")
-    else:
-        print("\nWARNING: analysis_output.json was not created.")
+    report_ok = os.path.exists(output_path)
+
+    console.print(Panel.fit(
+        f"[bold green]PIPELINE COMPLETE[/bold green]\n"
+        f"Total time  : [yellow]{elapsed_total}s[/yellow]\n"
+        f"Total cost  : [yellow]${total_cost:.4f}[/yellow]\n"
+        f"Final report: [cyan]{output_path if report_ok else 'NOT CREATED — check logs'}[/cyan]",
+        border_style="green",
+        padding=(0, 2),
+    ))
+
+    log.info("PIPELINE COMPLETE  elapsed=%.1fs  total_cost=$%.4f  report_ok=%s",
+             elapsed_total, total_cost, report_ok)
+
+    if not report_ok:
+        console.print("[red]WARNING: analysis_output.json was not created. Check pipeline.log for errors.[/red]")
 
     return total_cost
 
 
 if __name__ == "__main__":
-    asyncio.run(run_pipeline())
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", action="store_true", help="Skip Stage 1 and resume from Stage 2")
+    args = parser.parse_args()
+    asyncio.run(run_pipeline(resume=args.resume))
