@@ -234,7 +234,7 @@ with tab_opportunities:
                     header = f"{badge_emoji(risk_level)}  {coin_name} ({coin_symbol})"
                     with st.expander(header):
                         current_price = coin_data.get("current_price_usd")
-                        seven_d_change = coin_data.get("price_change_7d_pct")
+                        seven_d_change = coin_data.get("7d_change_pct")
                         entry_low = c.get("entry_price_low", c.get("entry_price_usd"))
                         entry_high = c.get("entry_price_high")
                         target_12m = c.get("price_target_12m")
