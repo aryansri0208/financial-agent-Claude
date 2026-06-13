@@ -221,18 +221,32 @@ with tab_opportunities:
 
             if etfs:
                 st.subheader("🗂️ ETFs")
+                etf_raw = load_stage(os.path.join(STAGE1_DIR, "etf.json"))
                 for e in etfs:
-                    etf_name = e.get("name") or ""
                     etf_ticker = e.get("ticker", "")
+                    conviction = e.get("conviction", "")
                     theme = e.get("theme", "")
-                    name_part = f" — {etf_name}" if etf_name and etf_name != etf_ticker else ""
-                    theme_part = f" ({theme})" if theme else ""
-                    header = f"**{etf_ticker}**{name_part}{theme_part}"
+                    etf_meta = etf_raw.get(etf_ticker, {}) if etf_raw else {}
+                    etf_full_name = etf_meta.get("name", etf_ticker) or etf_ticker
+                    header = f"{badge_emoji(conviction)}  {etf_full_name} ({etf_ticker})"
                     with st.expander(header):
-                        c1, c2, c3 = st.columns(3)
-                        c1.metric("Expense Ratio", f"{e.get('expense_ratio','—')}%")
-                        c2.metric("1yr Return", fmt_pct(e.get("1y_return_pct")))
-                        c3.metric("Suggested Alloc", f"{e.get('suggested_allocation_pct','—')}%")
+                        if theme:
+                            st.caption(theme)
+                        nav = etf_meta.get("nav")
+                        expense_ratio = etf_meta.get("expense_ratio")
+                        one_yr_return = etf_meta.get("1y_return_pct")
+                        alloc = e.get("suggested_allocation", e.get("suggested_allocation_pct", "—"))
+                        c1, c2, c3, c4 = st.columns(4)
+                        c1.metric("Current NAV", fmt_currency(nav))
+                        c2.metric("Expense Ratio", f"{expense_ratio}%" if expense_ratio is not None else "—")
+                        c3.metric("1yr Return", fmt_pct(one_yr_return))
+                        c4.metric("Suggested Alloc", f"{alloc}%" if alloc != "—" else "—")
+                        top_holdings = etf_meta.get("top_holdings", [])[:3]
+                        if top_holdings:
+                            holdings_str = ", ".join([h["symbol"] for h in top_holdings if h.get("symbol")])
+                            if holdings_str:
+                                st.markdown(f"**Top Holdings:** {holdings_str}")
+                        st.markdown("[🔗 News & Sentiment](#news-sentiment)")
                         st.markdown(f"**Reasoning:** {e.get('reasoning','')}")
 
             if cryptos:
