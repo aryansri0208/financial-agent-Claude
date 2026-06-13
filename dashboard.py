@@ -251,12 +251,38 @@ with tab_opportunities:
 
             if cryptos:
                 st.subheader("₿ Crypto")
+                crypto_raw = load_stage(os.path.join(STAGE1_DIR, "crypto.json"))
+                coins_by_id = crypto_raw.get("coins", {}) if crypto_raw else {}
+                # Build a lookup: symbol (uppercase) -> coin data
+                coins_by_symbol = {v.get("symbol", "").upper(): v for v in coins_by_id.values() if v.get("symbol")}
                 for c in cryptos:
-                    with st.expander(f"{badge(c.get('risk_level',''))}  **{c.get('symbol','').upper()}** ({c.get('coin_id','')})"):
-                        col1, col2 = st.columns(2)
-                        col1.metric("Entry Price", fmt_currency(c.get("entry_price_usd")))
-                        col2.metric("Risk", c.get("risk_level", "—"))
-                        st.markdown(f"**Thesis:** {c.get('thesis','')}")
+                    ticker = c.get("ticker", c.get("symbol", "")).upper()
+                    risk_level = c.get("risk_level", c.get("conviction", ""))
+                    # Fix: match ticker to coin data via symbol
+                    coin_data = coins_by_symbol.get(ticker, {})
+                    coin_name = coin_data.get("name", ticker)
+                    coin_symbol = coin_data.get("symbol", ticker).upper()
+                    header = f"{badge_emoji(risk_level)}  {coin_name} ({coin_symbol})"
+                    with st.expander(header):
+                        current_price = coin_data.get("current_price_usd")
+                        seven_d_change = coin_data.get("7d_change_pct")
+                        entry_low = c.get("entry_price_low", c.get("entry_price_usd"))
+                        entry_high = c.get("entry_price_high")
+                        target_12m = c.get("price_target_12m")
+                        alloc = c.get("suggested_allocation", "—")
+                        col1, col2, col3, col4 = st.columns(4)
+                        col1.metric("Current Price", fmt_currency(current_price))
+                        col2.metric("Entry Low", fmt_currency(entry_low))
+                        col3.metric("Entry High / 12m Target", fmt_currency(entry_high or target_12m))
+                        col4.metric("Risk Level", risk_level or "—")
+                        if seven_d_change is not None:
+                            st.metric("7d Change", fmt_pct(seven_d_change))
+                        if alloc != "—":
+                            st.metric("Suggested Allocation", f"{alloc}%")
+                        st.markdown("[🔗 News & Sentiment](#news-sentiment)")
+                        thesis = c.get("thesis", c.get("reasoning", ""))
+                        if thesis:
+                            st.markdown(f"**Thesis:** {thesis}")
 
         watchlist = data.get("watchlist", [])
         if watchlist:
