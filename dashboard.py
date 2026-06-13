@@ -7,6 +7,7 @@ from datetime import datetime
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import yfinance as yf
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_FILE = os.path.join(ROOT, "analysis_output.json")
@@ -35,6 +36,12 @@ def badge(rec: str) -> str:
     colors = {"HOLD": "🟡", "ADD": "🟢", "REDUCE": "🟠", "SELL": "🔴",
               "HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}
     return f"{colors.get(rec, '⚪')} {rec}"
+
+
+def badge_emoji(rec: str) -> str:
+    colors = {"HOLD": "🟡", "ADD": "🟢", "REDUCE": "🟠", "SELL": "🔴",
+              "HIGH": "🟢", "MEDIUM": "🟡", "LOW": "🔴"}
+    return colors.get(rec.upper() if rec else "", "⚪")
 
 
 def fmt_currency(val) -> str:
@@ -180,16 +187,32 @@ with tab_opportunities:
 
             if stocks:
                 st.subheader("📈 Stocks")
+                _stock_name_cache: dict = {}
                 for s in stocks:
-                    name = s.get("name") or ""
                     ticker = s.get("ticker", "")
-                    label = f"**{ticker}**" + (f" — {name}" if name and name != ticker else "")
-                    with st.expander(f"{badge(s.get('conviction',''))}  {label}"):
-                        c1, c2, c3, c4 = st.columns(4)
-                        c1.metric("Entry Low", fmt_currency(s.get("entry_price_low")))
-                        c2.metric("Entry High", fmt_currency(s.get("entry_price_high")))
-                        c3.metric("12m Target", fmt_currency(s.get("price_target_12m")))
-                        c4.metric("Best Time", s.get("best_time_to_buy", "—"))
+                    conviction = s.get("conviction", "")
+                    if ticker not in _stock_name_cache:
+                        try:
+                            _stock_name_cache[ticker] = yf.Ticker(ticker).info.get("longName", ticker)
+                        except Exception:
+                            _stock_name_cache[ticker] = ticker
+                    full_name = _stock_name_cache[ticker]
+                    header = f"{badge_emoji(conviction)}  {full_name} ({ticker})"
+                    with st.expander(header):
+                        try:
+                            current_price = yf.Ticker(ticker).fast_info.last_price
+                        except Exception:
+                            current_price = None
+                        c1, c2, c3, c4, c5 = st.columns(5)
+                        c1.metric("Current Price", fmt_currency(current_price))
+                        c2.metric("Entry Low", fmt_currency(s.get("entry_price_low")))
+                        c3.metric("Entry High", fmt_currency(s.get("entry_price_high")))
+                        c4.metric("12m Target", fmt_currency(s.get("price_target_12m")))
+                        c5.metric("Best Time", s.get("best_time_to_buy", "—"))
+                        alloc = s.get("suggested_allocation", s.get("suggested_allocation_pct", "—"))
+                        if alloc != "—":
+                            st.metric("Suggested Allocation", f"{alloc}%")
+                        st.markdown("[🔗 News & Sentiment](#news-sentiment)")
                         st.markdown(f"**Reasoning:** {s.get('reasoning','')}")
                         if s.get("catalysts"):
                             st.markdown("**Catalysts:** " + " · ".join(s["catalysts"]))
